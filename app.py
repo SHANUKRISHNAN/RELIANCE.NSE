@@ -115,8 +115,12 @@ st.markdown("""
 # ═══════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════════
-MODELS_DIR = "models"
-DATA_DIR   = "data"
+# ── Absolute paths — works on Streamlit Cloud AND locally ──────────────────
+# os.path.dirname(__file__) gives the directory where app.py lives
+# regardless of what the current working directory is
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+DATA_DIR   = os.path.join(BASE_DIR, "data")
 
 FEATURE_COLS = [
     "Open","High","Low","Close","Volume",
