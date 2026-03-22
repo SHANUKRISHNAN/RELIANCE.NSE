@@ -15,7 +15,6 @@ from plotly.subplots import make_subplots
 import joblib
 
 warnings.filterwarnings("ignore")
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 # ── Page config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -115,7 +114,7 @@ st.markdown("""
 # ═══════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════════
-# ── Absolute paths — works on Streamlit Cloud AND locally ──────────────────
+# ── Absolute paths ─────────────────────────────────────────────────────────
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 DATA_DIR   = os.path.join(BASE_DIR, "data")
@@ -131,55 +130,165 @@ SEQUENCE_LEN = 60
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TFLITE INFERENCE ENGINE
+# PURE NUMPY GRU + ATTENTION INFERENCE ENGINE
 # ═══════════════════════════════════════════════════════════════════════════
-# We use TFLite instead of the full Keras model for two reasons:
-#   1. TFLite is completely version-independent — no Keras format mismatch
-#   2. The .tflite file is smaller and loads faster on Streamlit Cloud
-#
-# TFLite interpreter is included in the standard tensorflow package.
-# No custom objects or serialization format needed.
+# No TensorFlow. No Keras. No version issues. Ever.
+# Implements the exact same forward pass as the trained model.
 
-class TFLiteModel:
+def _sigmoid(x):   return 1.0 / (1.0 + np.exp(-np.clip(x, -88, 88)))
+def _tanh(x):      return np.tanh(np.clip(x, -88, 88))
+def _relu(x):      return np.maximum(0.0, x)
+def _softmax(x):   e = np.exp(x - x.max(axis=-1, keepdims=True)); return e / e.sum(axis=-1, keepdims=True)
+
+
+def _bn(x, gamma, beta, mean, var, eps=1e-3):
+    """Batch Normalization forward pass (inference mode — uses stored mean/var)."""
+    return gamma * (x - mean) / np.sqrt(var + eps) + beta
+
+
+def _gru_step(x_t, h_prev, kernel, rec_kernel, bias):
     """
-    Thin wrapper around tf.lite.Interpreter that mimics the
-    model.predict(X) interface used throughout the app.
+    Single GRU timestep (Keras default gate order: z, r, h).
+
+    kernel      : (input_dim, 3*units)
+    rec_kernel  : (units, 3*units)
+    bias        : (2, 3*units)  → [input_bias, recurrent_bias]
     """
-    def __init__(self, tflite_path: str):
-        import tensorflow as tf
-        self.interpreter = tf.lite.Interpreter(model_path=tflite_path)
-        self.interpreter.allocate_tensors()
-        self.input_details  = self.interpreter.get_input_details()
-        self.output_details = self.interpreter.get_output_details()
+    units = h_prev.shape[-1]
 
-    def predict(self, X: np.ndarray, **kwargs) -> np.ndarray:
+    # Split kernels into gate slices: [z | r | h]
+    Wz, Wr, Wh = kernel[:, :units],     kernel[:, units:2*units],     kernel[:, 2*units:]
+    Uz, Ur, Uh = rec_kernel[:, :units], rec_kernel[:, units:2*units], rec_kernel[:, 2*units:]
+
+    # Input and recurrent biases
+    bz_i, br_i, bh_i = bias[0, :units], bias[0, units:2*units], bias[0, 2*units:]
+    bz_r, br_r, bh_r = bias[1, :units], bias[1, units:2*units], bias[1, 2*units:]
+
+    z = _sigmoid(x_t @ Wz + bz_i + h_prev @ Uz + bz_r)   # update gate
+    r = _sigmoid(x_t @ Wr + br_i + h_prev @ Ur + br_r)   # reset gate
+    h_cand = _tanh(x_t @ Wh + bh_i + r * (h_prev @ Uh + bh_r))  # candidate
+    h_new  = (1.0 - z) * h_cand + z * h_prev
+    return h_new
+
+
+def _gru_layer(X, kernel, rec_kernel, bias):
+    """
+    Full GRU forward pass over sequence X.
+    X shape: (batch, timesteps, input_dim)
+    Returns all hidden states: (batch, timesteps, units)
+    """
+    batch, T, _  = X.shape
+    units        = rec_kernel.shape[0]
+    H            = np.zeros((batch, T, units), dtype=np.float32)
+    h            = np.zeros((batch, units),    dtype=np.float32)
+
+    for t in range(T):
+        h      = _gru_step(X[:, t, :], h, kernel, rec_kernel, bias)
+        H[:, t, :] = h
+
+    return H
+
+
+def _attention(H, W_kernel, W_bias, V_kernel, V_bias):
+    """
+    Bahdanau attention.
+    H shape: (batch, T, units)
+    Returns context (batch, units) and alpha weights (batch, T, 1)
+    """
+    score   = _tanh(H @ W_kernel + W_bias)             # (batch, T, attn_units)
+    energy  = score @ V_kernel + V_bias                 # (batch, T, 1)
+    alpha   = _softmax(energy)                          # (batch, T, 1)
+    context = np.sum(alpha * H, axis=1)                 # (batch, units)
+    return context, alpha
+
+
+class NumpyGRU:
+    """
+    Pure NumPy forward-pass of AttnGRU_v4.
+    Loaded from models/gru_weights.npz — no TensorFlow required.
+    """
+    def __init__(self, weights_path: str):
+        w = np.load(weights_path)
+
+        # GRU layers
+        self.gru1_k  = w["gru1_kernel"].astype(np.float32)
+        self.gru1_rk = w["gru1_rec_kernel"].astype(np.float32)
+        self.gru1_b  = w["gru1_bias"].astype(np.float32)
+
+        self.gru2_k  = w["gru2_kernel"].astype(np.float32)
+        self.gru2_rk = w["gru2_rec_kernel"].astype(np.float32)
+        self.gru2_b  = w["gru2_bias"].astype(np.float32)
+
+        # Batch norms
+        self.bn1 = (w["bn1_gamma"].astype(np.float32), w["bn1_beta"].astype(np.float32),
+                    w["bn1_mean"].astype(np.float32),  w["bn1_var"].astype(np.float32))
+        self.bn2 = (w["bn2_gamma"].astype(np.float32), w["bn2_beta"].astype(np.float32),
+                    w["bn2_mean"].astype(np.float32),  w["bn2_var"].astype(np.float32))
+
+        # Attention
+        self.attn_Wk = w["attn_W_kernel"].astype(np.float32)
+        self.attn_Wb = w["attn_W_bias"].astype(np.float32)
+        self.attn_Vk = w["attn_V_kernel"].astype(np.float32)
+        self.attn_Vb = w["attn_V_bias"].astype(np.float32)
+
+        # Dense head — find the right keys
+        def _get(prefix):
+            k = next((x for x in w.files if x.startswith(prefix+"_k")), None)
+            b = next((x for x in w.files if x.startswith(prefix+"_b")), None)
+            return w[k].astype(np.float32), w[b].astype(np.float32)
+
+        dense_keys = sorted([x for x in w.files if "dense" in x and "kernel" in x])
+        self.dense_layers = []
+        for dk in dense_keys:
+            bk = dk.replace("kernel", "bias")
+            self.dense_layers.append(
+                (w[dk].astype(np.float32), w[bk].astype(np.float32))
+            )
+
+        self.out_k = w["out_kernel"].astype(np.float32)
+        self.out_b = w["out_bias"].astype(np.float32)
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
         """
-        Run inference on a batch.
-        TFLite requires per-sample inference (no native batching),
-        so we loop and stack results.
+        X shape: (batch, SEQUENCE_LEN, n_features)
+        Returns: (batch, 1) — scaled log return predictions
         """
-        results = []
-        for i in range(len(X)):
-            sample = X[i:i+1].astype(np.float32)
-            self.interpreter.resize_input_tensor(
-                self.input_details[0]["index"], sample.shape
-            )
-            self.interpreter.allocate_tensors()
-            self.interpreter.set_tensor(
-                self.input_details[0]["index"], sample
-            )
-            self.interpreter.invoke()
-            out = self.interpreter.get_tensor(
-                self.output_details[0]["index"]
-            )
-            results.append(out[0])
-        return np.array(results)
+        X = X.astype(np.float32)
+
+        # GRU 1 + BN 1
+        H1 = _gru_layer(X,  self.gru1_k, self.gru1_rk, self.gru1_b)
+        H1 = _bn(H1, *self.bn1)
+
+        # GRU 2 + BN 2
+        H2 = _gru_layer(H1, self.gru2_k, self.gru2_rk, self.gru2_b)
+        H2 = _bn(H2, *self.bn2)
+
+        # Attention
+        context, self._last_alpha = _attention(
+            H2, self.attn_Wk, self.attn_Wb, self.attn_Vk, self.attn_Vb
+        )
+
+        # Dense head
+        x = context
+        for i, (W, b) in enumerate(self.dense_layers):
+            x = _relu(x @ W + b)
+
+        # Output
+        out = x @ self.out_k + self.out_b
+        return out                               # (batch, 1)
+
+    def get_attention_weights(self):
+        """Returns last computed attention weights (batch, T, 1)."""
+        return getattr(self, "_last_alpha", None)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# LOAD ARTEFACTS  (cached)
+# ═══════════════════════════════════════════════════════════════════════════
 @st.cache_resource(show_spinner="Loading model…")
 def load_model_and_scalers():
-    tflite_path = os.path.join(MODELS_DIR, "attn_gru.tflite")
-    model       = TFLiteModel(tflite_path)
+    npz_path = os.path.join(MODELS_DIR, "gru_weights.npz")
+    model    = NumpyGRU(npz_path)
 
     f_scaler = joblib.load(os.path.join(MODELS_DIR, "feature_scaler.pkl"))
     t_scaler = joblib.load(os.path.join(MODELS_DIR, "target_scaler.pkl"))
@@ -187,11 +296,7 @@ def load_model_and_scalers():
     with open(os.path.join(MODELS_DIR, "model_config.json")) as f:
         cfg = json.load(f)
 
-    # attn_model is None — TFLite doesn't expose intermediate layers.
-    # The Attention Insights page uses pre-computed weights from the
-    # test forecast residuals instead.
-    attn_model = None
-
+    attn_model = None    # not needed — NumpyGRU stores alpha internally
     return model, attn_model, f_scaler, t_scaler, cfg
 
 
@@ -273,8 +378,8 @@ def run_inference(df, model, attn_model, f_scaler, t_scaler, cfg):
     y_raw = t_scaler.transform(df[["Log_Return"]])
     X, y  = make_sequences(X_raw, y_raw, seq_len)
 
-    # TFLite predict — returns (n_samples, 1)
-    y_pred_s  = model.predict(X)
+    y_pred_s  = model.predict(X)                         # (n, 1)
+    attn_w    = model.get_attention_weights()            # (n, T, 1)
     y_pred_lr = t_scaler.inverse_transform(y_pred_s).flatten()
     y_true_lr = t_scaler.inverse_transform(y).flatten()
 
@@ -285,7 +390,7 @@ def run_inference(df, model, attn_model, f_scaler, t_scaler, cfg):
         y_true_lr, y_pred_lr, anchors, reset_every
     )
 
-    return dates, y_true_p, y_pred_p, None, y_true_lr, y_pred_lr
+    return dates, y_true_p, y_pred_p, attn_w, y_true_lr, y_pred_lr
 
 
 def predict_next_close(model, f_scaler, t_scaler, df, cfg):
@@ -826,75 +931,66 @@ elif page == "🧠  Attention Insights":
     st.markdown("## 🧠 Attention Weight Insights")
 
     st.markdown(
-        "<div class='info-box'>"
-        "Attention weights show which of the last 60 trading days the model "
-        "focused on most. This chart shows the <b>pre-computed average attention "
-        "pattern</b> from the test set, derived at training time. "
-        "TFLite deployment does not expose intermediate layer outputs — "
-        "to recompute live attention, run the full <code>.keras</code> model locally."
-        "</div>",
+        "<div class='info-box'>Attention weights reveal which of the last "
+        "60 trading days the model focuses on most. Computed live using "
+        "the NumPy GRU engine. Red bars = top 5 most attended days.</div>",
         unsafe_allow_html=True
     )
 
-    # ── Pre-computed attention derived from test residuals ────────────────
-    # The model's attention follows a known pattern: highest weight on
-    # the most recent 1–5 days, with secondary peaks at 10–15 days ago.
-    # This is reconstructed from the decay profile observed during training.
-    # Shape: (SEQUENCE_LEN,) — index 0 = 60 days ago, index 59 = 1 day ago
-    np.random.seed(42)
-    days_ago  = np.arange(SEQUENCE_LEN, 0, -1)      # 60 → 1
+    if len(df) < SEQUENCE_LEN + 5:
+        st.error("Not enough data rows.")
+        st.stop()
 
-    # Exponential decay toward recent days + small periodic bumps
-    base     = np.exp(np.linspace(-3.5, 0, SEQUENCE_LEN))
-    bumps    = np.zeros(SEQUENCE_LEN)
-    for peak in [5, 10, 20]:                         # weekly/biweekly patterns
-        idx = SEQUENCE_LEN - peak
-        if 0 <= idx < SEQUENCE_LEN:
-            bumps[idx] += 0.3 * base[idx]
-    avg_attn = base + bumps
-    avg_attn = avg_attn / avg_attn.sum()             # normalize to sum=1
+    with st.spinner("Computing attention weights…"):
+        subset = df.tail(200 + SEQUENCE_LEN)
+        X_raw  = f_scaler.transform(subset[FEATURE_COLS])
+        y_raw  = t_scaler.transform(subset[["Log_Return"]])
+        X, _   = make_sequences(X_raw, y_raw, SEQUENCE_LEN)
+        _      = model.predict(X)                        # populates internal alpha
+        attn_w = model.get_attention_weights()           # (n, T, 1)
 
-    top5_idx = np.argsort(avg_attn)[-5:]
-    colors   = ["#ef4444" if i in set(top5_idx) else "#60a5fa"
-                for i in range(SEQUENCE_LEN)]
+    tab1, tab2 = st.tabs(["📊 Average (Last 200 days)", "🔍 Single day"])
 
-    fig = go.Figure(go.Bar(
-        x=days_ago, y=avg_attn, marker_color=colors,
-        hovertemplate="Days ago: %{x}<br>Weight: %{y:.4f}<extra></extra>"
-    ))
-    fig.update_layout(
-        title="Attention Focus — Pre-computed from Training<br>"
-              "<sub style='color:#94a3b8'>Red = Top 5 attended days · "
-              "Higher bar = model pays more attention to that day</sub>",
-        xaxis_title="Days Ago (within 60-day window)",
-        yaxis_title="Avg Attention Weight",
-        **DARK_LAYOUT
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    with tab1:
+        st.plotly_chart(
+            chart_attention(attn_w, SEQUENCE_LEN),
+            use_container_width=True
+        )
+        avg      = attn_w.mean(axis=0).flatten()
+        top5     = sorted(np.argsort(avg)[-5:][::-1],
+                          key=lambda i: avg[i], reverse=True)
+        days_ago = list(range(SEQUENCE_LEN, 0, -1))
 
-    # Top 5 attended days cards
-    top5_sorted = sorted(top5_idx, key=lambda i: avg_attn[i], reverse=True)
-    st.markdown("<div class='section-header'>Top 5 Attended Days</div>",
-                unsafe_allow_html=True)
-    cols = st.columns(5)
-    for col, idx in zip(cols, top5_sorted):
-        col.markdown(f"""
-        <div class='metric-card'>
-            <div class='value' style='color:#ef4444'>{days_ago[idx]}d</div>
-            <div class='label'>Days ago</div>
-            <div class='sublabel'>Weight: {avg_attn[idx]:.4f}</div>
-        </div>""", unsafe_allow_html=True)
+        st.markdown("<div class='section-header'>Top 5 Attended Days</div>",
+                    unsafe_allow_html=True)
+        cols = st.columns(5)
+        for col, idx in zip(cols, top5):
+            col.markdown(f"""
+            <div class='metric-card'>
+                <div class='value' style='color:#ef4444'>
+                    {days_ago[idx]}d
+                </div>
+                <div class='label'>Days ago</div>
+                <div class='sublabel'>Weight: {avg[idx]:.4f}</div>
+            </div>""", unsafe_allow_html=True)
 
-    st.markdown(
-        "<div class='info-box'><b>How to read this:</b> "
-        "Bars near the <b>right</b> (days_ago = 1–5) mean the model relies "
-        "heavily on recent momentum. Secondary peaks at 10–20 days reflect "
-        "weekly and biweekly cyclical patterns the model learned. "
-        "The exponential decay toward recent days is typical for financial "
-        "GRU models — recent price action is more informative than older history."
-        "</div>",
-        unsafe_allow_html=True
-    )
+        st.markdown(
+            "<div class='info-box'><b>How to read this:</b> If the highest "
+            "bars are near the right (days_ago = 1–5), the model relies on "
+            "recent momentum. Spikes further left suggest recurring pattern "
+            "at that lag distance (e.g. weekly cycles, earnings windows)."
+            "</div>",
+            unsafe_allow_html=True
+        )
+
+    with tab2:
+        n_samples = len(attn_w)
+        idx = st.slider("Sample index", 0, n_samples - 1, n_samples - 1)
+        st.plotly_chart(
+            chart_attention(attn_w[idx:idx+1], SEQUENCE_LEN),
+            use_container_width=True
+        )
+        st.caption(f"Date: {subset.index[SEQUENCE_LEN + idx].date()}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
