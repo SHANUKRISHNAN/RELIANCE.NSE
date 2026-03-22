@@ -205,48 +205,78 @@ def _attention(H, W_kernel, W_bias, V_kernel, V_bias):
 class NumpyGRU:
     """
     Pure NumPy forward-pass of AttnGRU_v4.
-    Loaded from models/gru_weights.npz — no TensorFlow required.
+    Loaded from gru_weights.npz — no TensorFlow required.
     """
     def __init__(self, weights_path: str):
-        w = np.load(weights_path)
+        w = np.load(weights_path, allow_pickle=False)
 
-        # GRU layers
-        self.gru1_k  = w["gru1_kernel"].astype(np.float32)
-        self.gru1_rk = w["gru1_rec_kernel"].astype(np.float32)
-        self.gru1_b  = w["gru1_bias"].astype(np.float32)
+        # ── Print all keys for debugging ───────────────────────────────
+        all_keys = list(w.files)
 
-        self.gru2_k  = w["gru2_kernel"].astype(np.float32)
-        self.gru2_rk = w["gru2_rec_kernel"].astype(np.float32)
-        self.gru2_b  = w["gru2_bias"].astype(np.float32)
+        def load(key):
+            if key in w:
+                return w[key].astype(np.float32)
+            raise KeyError(f"Key '{key}' not found in npz. Available: {all_keys}")
 
-        # Batch norms
-        self.bn1 = (w["bn1_gamma"].astype(np.float32), w["bn1_beta"].astype(np.float32),
-                    w["bn1_mean"].astype(np.float32),  w["bn1_var"].astype(np.float32))
-        self.bn2 = (w["bn2_gamma"].astype(np.float32), w["bn2_beta"].astype(np.float32),
-                    w["bn2_mean"].astype(np.float32),  w["bn2_var"].astype(np.float32))
+        # ── GRU layers ─────────────────────────────────────────────────
+        self.gru1_k  = load("gru1_kernel")
+        self.gru1_rk = load("gru1_rec_kernel")
+        self.gru1_b  = load("gru1_bias")
 
-        # Attention
-        self.attn_Wk = w["attn_W_kernel"].astype(np.float32)
-        self.attn_Wb = w["attn_W_bias"].astype(np.float32)
-        self.attn_Vk = w["attn_V_kernel"].astype(np.float32)
-        self.attn_Vb = w["attn_V_bias"].astype(np.float32)
+        self.gru2_k  = load("gru2_kernel")
+        self.gru2_rk = load("gru2_rec_kernel")
+        self.gru2_b  = load("gru2_bias")
 
-        # Dense head — find the right keys
-        def _get(prefix):
-            k = next((x for x in w.files if x.startswith(prefix+"_k")), None)
-            b = next((x for x in w.files if x.startswith(prefix+"_b")), None)
-            return w[k].astype(np.float32), w[b].astype(np.float32)
+        # ── Batch norms ────────────────────────────────────────────────
+        self.bn1 = (load("bn1_gamma"), load("bn1_beta"),
+                    load("bn1_mean"),  load("bn1_var"))
+        self.bn2 = (load("bn2_gamma"), load("bn2_beta"),
+                    load("bn2_mean"),  load("bn2_var"))
 
-        dense_keys = sorted([x for x in w.files if "dense" in x and "kernel" in x])
+        # ── Attention ──────────────────────────────────────────────────
+        self.attn_Wk = load("attn_W_kernel")
+        self.attn_Wb = load("attn_W_bias")
+        self.attn_Vk = load("attn_V_kernel")
+        self.attn_Vb = load("attn_V_bias")
+
+        # ── Dense head ─────────────────────────────────────────────────
+        # Collect all dense layer kernels in sorted order
+        # Keys look like: dense0_kernel, dense1_kernel, dense2_kernel
+        # The LAST dense kernel with output dim=1 is the output layer
+        dense_kernel_keys = sorted(
+            [k for k in all_keys if "dense" in k and "kernel" in k
+             and k != "out_kernel"],
+            key=lambda k: k  # alphabetical: dense0 < dense1 < dense2
+        )
+
         self.dense_layers = []
-        for dk in dense_keys:
+        for dk in dense_kernel_keys:
             bk = dk.replace("kernel", "bias")
-            self.dense_layers.append(
-                (w[dk].astype(np.float32), w[bk].astype(np.float32))
-            )
+            if bk in all_keys:
+                W = w[dk].astype(np.float32)
+                b = w[bk].astype(np.float32)
+                # If output dim is 1 → this IS the output layer
+                if W.shape[1] == 1:
+                    self.out_k = W
+                    self.out_b = b
+                else:
+                    self.dense_layers.append((W, b))
 
-        self.out_k = w["out_kernel"].astype(np.float32)
-        self.out_b = w["out_bias"].astype(np.float32)
+        # Explicit out_kernel/out_bias override if present
+        if "out_kernel" in all_keys:
+            self.out_k = load("out_kernel")
+            self.out_b = load("out_bias")
+
+        # ── Validate output layer exists ───────────────────────────────
+        if not hasattr(self, "out_k"):
+            # Last resort: use the last dense layer as output
+            if self.dense_layers:
+                self.out_k, self.out_b = self.dense_layers.pop()
+            else:
+                raise ValueError(
+                    f"Cannot find output layer weights. "
+                    f"Available keys: {all_keys}"
+                )
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """
