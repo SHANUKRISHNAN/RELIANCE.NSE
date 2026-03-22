@@ -15,6 +15,7 @@ from plotly.subplots import make_subplots
 import joblib
 
 warnings.filterwarnings("ignore")
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 # ── Page config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -114,7 +115,6 @@ st.markdown("""
 # ═══════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════════
-# ── Absolute paths ─────────────────────────────────────────────────────────
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 DATA_DIR   = os.path.join(BASE_DIR, "data")
@@ -128,158 +128,36 @@ FEATURE_COLS = [
 ]
 SEQUENCE_LEN = 60
 
+# ── DEBUG: show exactly what files Streamlit Cloud can see ─────────────────
+# Remove this block once the app is working
+with st.expander("🔍 Debug — File System (remove after fix)", expanded=True):
+    st.code(f"BASE_DIR   = {BASE_DIR}")
+    st.code(f"MODELS_DIR = {MODELS_DIR}")
+    st.code(f"DATA_DIR   = {DATA_DIR}")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# PURE NUMPY GRU + ATTENTION INFERENCE ENGINE
-# ═══════════════════════════════════════════════════════════════════════════
-# No TensorFlow. No Keras. No version issues. Ever.
-# Implements the exact same forward pass as the trained model.
+    st.markdown("**Files in MODELS_DIR:**")
+    if os.path.exists(MODELS_DIR):
+        files = os.listdir(MODELS_DIR)
+        for f in sorted(files):
+            fp   = os.path.join(MODELS_DIR, f)
+            size = os.path.getsize(fp) / 1024
+            st.write(f"  `{f}` — {size:.1f} KB")
+    else:
+        st.error(f"MODELS_DIR does not exist: {MODELS_DIR}")
 
-def _sigmoid(x):   return 1.0 / (1.0 + np.exp(-np.clip(x, -88, 88)))
-def _tanh(x):      return np.tanh(np.clip(x, -88, 88))
-def _relu(x):      return np.maximum(0.0, x)
-def _softmax(x):   e = np.exp(x - x.max(axis=-1, keepdims=True)); return e / e.sum(axis=-1, keepdims=True)
+    st.markdown("**Files in DATA_DIR:**")
+    if os.path.exists(DATA_DIR):
+        files = os.listdir(DATA_DIR)
+        for f in sorted(files):
+            fp   = os.path.join(DATA_DIR, f)
+            size = os.path.getsize(fp) / 1024
+            st.write(f"  `{f}` — {size:.1f} KB")
+    else:
+        st.error(f"DATA_DIR does not exist: {DATA_DIR}")
 
-
-def _bn(x, gamma, beta, mean, var, eps=1e-3):
-    """Batch Normalization forward pass (inference mode — uses stored mean/var)."""
-    return gamma * (x - mean) / np.sqrt(var + eps) + beta
-
-
-def _gru_step(x_t, h_prev, kernel, rec_kernel, bias):
-    """
-    Single GRU timestep (Keras default gate order: z, r, h).
-
-    kernel      : (input_dim, 3*units)
-    rec_kernel  : (units, 3*units)
-    bias        : (2, 3*units)  → [input_bias, recurrent_bias]
-    """
-    units = h_prev.shape[-1]
-
-    # Split kernels into gate slices: [z | r | h]
-    Wz, Wr, Wh = kernel[:, :units],     kernel[:, units:2*units],     kernel[:, 2*units:]
-    Uz, Ur, Uh = rec_kernel[:, :units], rec_kernel[:, units:2*units], rec_kernel[:, 2*units:]
-
-    # Input and recurrent biases
-    bz_i, br_i, bh_i = bias[0, :units], bias[0, units:2*units], bias[0, 2*units:]
-    bz_r, br_r, bh_r = bias[1, :units], bias[1, units:2*units], bias[1, 2*units:]
-
-    z = _sigmoid(x_t @ Wz + bz_i + h_prev @ Uz + bz_r)   # update gate
-    r = _sigmoid(x_t @ Wr + br_i + h_prev @ Ur + br_r)   # reset gate
-    h_cand = _tanh(x_t @ Wh + bh_i + r * (h_prev @ Uh + bh_r))  # candidate
-    h_new  = (1.0 - z) * h_cand + z * h_prev
-    return h_new
-
-
-def _gru_layer(X, kernel, rec_kernel, bias):
-    """
-    Full GRU forward pass over sequence X.
-    X shape: (batch, timesteps, input_dim)
-    Returns all hidden states: (batch, timesteps, units)
-    """
-    batch, T, _  = X.shape
-    units        = rec_kernel.shape[0]
-    H            = np.zeros((batch, T, units), dtype=np.float32)
-    h            = np.zeros((batch, units),    dtype=np.float32)
-
-    for t in range(T):
-        h      = _gru_step(X[:, t, :], h, kernel, rec_kernel, bias)
-        H[:, t, :] = h
-
-    return H
-
-
-def _attention(H, W_kernel, W_bias, V_kernel, V_bias):
-    """
-    Bahdanau attention.
-    H shape: (batch, T, units)
-    Returns context (batch, units) and alpha weights (batch, T, 1)
-    """
-    score   = _tanh(H @ W_kernel + W_bias)             # (batch, T, attn_units)
-    energy  = score @ V_kernel + V_bias                 # (batch, T, 1)
-    alpha   = _softmax(energy)                          # (batch, T, 1)
-    context = np.sum(alpha * H, axis=1)                 # (batch, units)
-    return context, alpha
-
-
-class NumpyGRU:
-    """
-    Pure NumPy forward-pass of AttnGRU_v4.
-    Loaded from models/gru_weights.npz — no TensorFlow required.
-    """
-    def __init__(self, weights_path: str):
-        w = np.load(weights_path)
-
-        # GRU layers
-        self.gru1_k  = w["gru1_kernel"].astype(np.float32)
-        self.gru1_rk = w["gru1_rec_kernel"].astype(np.float32)
-        self.gru1_b  = w["gru1_bias"].astype(np.float32)
-
-        self.gru2_k  = w["gru2_kernel"].astype(np.float32)
-        self.gru2_rk = w["gru2_rec_kernel"].astype(np.float32)
-        self.gru2_b  = w["gru2_bias"].astype(np.float32)
-
-        # Batch norms
-        self.bn1 = (w["bn1_gamma"].astype(np.float32), w["bn1_beta"].astype(np.float32),
-                    w["bn1_mean"].astype(np.float32),  w["bn1_var"].astype(np.float32))
-        self.bn2 = (w["bn2_gamma"].astype(np.float32), w["bn2_beta"].astype(np.float32),
-                    w["bn2_mean"].astype(np.float32),  w["bn2_var"].astype(np.float32))
-
-        # Attention
-        self.attn_Wk = w["attn_W_kernel"].astype(np.float32)
-        self.attn_Wb = w["attn_W_bias"].astype(np.float32)
-        self.attn_Vk = w["attn_V_kernel"].astype(np.float32)
-        self.attn_Vb = w["attn_V_bias"].astype(np.float32)
-
-        # Dense head — find the right keys
-        def _get(prefix):
-            k = next((x for x in w.files if x.startswith(prefix+"_k")), None)
-            b = next((x for x in w.files if x.startswith(prefix+"_b")), None)
-            return w[k].astype(np.float32), w[b].astype(np.float32)
-
-        dense_keys = sorted([x for x in w.files if "dense" in x and "kernel" in x])
-        self.dense_layers = []
-        for dk in dense_keys:
-            bk = dk.replace("kernel", "bias")
-            self.dense_layers.append(
-                (w[dk].astype(np.float32), w[bk].astype(np.float32))
-            )
-
-        self.out_k = w["out_kernel"].astype(np.float32)
-        self.out_b = w["out_bias"].astype(np.float32)
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        """
-        X shape: (batch, SEQUENCE_LEN, n_features)
-        Returns: (batch, 1) — scaled log return predictions
-        """
-        X = X.astype(np.float32)
-
-        # GRU 1 + BN 1
-        H1 = _gru_layer(X,  self.gru1_k, self.gru1_rk, self.gru1_b)
-        H1 = _bn(H1, *self.bn1)
-
-        # GRU 2 + BN 2
-        H2 = _gru_layer(H1, self.gru2_k, self.gru2_rk, self.gru2_b)
-        H2 = _bn(H2, *self.bn2)
-
-        # Attention
-        context, self._last_alpha = _attention(
-            H2, self.attn_Wk, self.attn_Wb, self.attn_Vk, self.attn_Vb
-        )
-
-        # Dense head
-        x = context
-        for i, (W, b) in enumerate(self.dense_layers):
-            x = _relu(x @ W + b)
-
-        # Output
-        out = x @ self.out_k + self.out_b
-        return out                               # (batch, 1)
-
-    def get_attention_weights(self):
-        """Returns last computed attention weights (batch, T, 1)."""
-        return getattr(self, "_last_alpha", None)
+    st.markdown("**Repo root contents:**")
+    for f in sorted(os.listdir(BASE_DIR)):
+        st.write(f"  `{f}`")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -287,8 +165,41 @@ class NumpyGRU:
 # ═══════════════════════════════════════════════════════════════════════════
 @st.cache_resource(show_spinner="Loading model…")
 def load_model_and_scalers():
-    npz_path = os.path.join(MODELS_DIR, "gru_weights.npz")
-    model    = NumpyGRU(npz_path)
+    import tensorflow as tf
+    from tensorflow.keras import layers
+    from tensorflow.keras.utils import register_keras_serializable
+
+    @register_keras_serializable()
+    class BahdanauAttention(layers.Layer):
+        def __init__(self, units, **kwargs):
+            super().__init__(**kwargs)
+            self.units = units
+            self.W     = layers.Dense(units)
+            self.V     = layers.Dense(1)
+
+        def call(self, hidden_states):
+            score   = tf.nn.tanh(self.W(hidden_states))
+            alpha   = tf.nn.softmax(self.V(score), axis=1)
+            context = tf.reduce_sum(alpha * hidden_states, axis=1)
+            return context, alpha
+
+        def get_config(self):
+            cfg = super().get_config()
+            cfg.update({"units": self.units})
+            return cfg
+
+    model = tf.keras.models.load_model(
+        os.path.join(MODELS_DIR, "attn_gru_final.keras"),
+        custom_objects={"BahdanauAttention": BahdanauAttention}
+    )
+
+    # Attention sub-model for weight visualization
+    from tensorflow.keras import Model
+    attn_model = Model(
+        inputs  = model.input,
+        outputs = [model.output,
+                   model.get_layer("attention").output[1]]
+    )
 
     f_scaler = joblib.load(os.path.join(MODELS_DIR, "feature_scaler.pkl"))
     t_scaler = joblib.load(os.path.join(MODELS_DIR, "target_scaler.pkl"))
@@ -296,7 +207,6 @@ def load_model_and_scalers():
     with open(os.path.join(MODELS_DIR, "model_config.json")) as f:
         cfg = json.load(f)
 
-    attn_model = None    # not needed — NumpyGRU stores alpha internally
     return model, attn_model, f_scaler, t_scaler, cfg
 
 
@@ -378,8 +288,7 @@ def run_inference(df, model, attn_model, f_scaler, t_scaler, cfg):
     y_raw = t_scaler.transform(df[["Log_Return"]])
     X, y  = make_sequences(X_raw, y_raw, seq_len)
 
-    y_pred_s  = model.predict(X)                         # (n, 1)
-    attn_w    = model.get_attention_weights()            # (n, T, 1)
+    y_pred_s, attn_w = attn_model.predict(X, verbose=0, batch_size=64)
     y_pred_lr = t_scaler.inverse_transform(y_pred_s).flatten()
     y_true_lr = t_scaler.inverse_transform(y).flatten()
 
@@ -397,8 +306,8 @@ def predict_next_close(model, f_scaler, t_scaler, df, cfg):
     """Predict the next single day's close."""
     seq_len = cfg["sequence_len"]
     window  = df[FEATURE_COLS].iloc[-seq_len:]
-    X       = f_scaler.transform(window)[np.newaxis].astype(np.float32)
-    pred_s  = model.predict(X)                          # (1, 1)
+    X       = f_scaler.transform(window)[np.newaxis]
+    pred_s  = model.predict(X, verbose=0)
     pred_lr = t_scaler.inverse_transform(pred_s)[0, 0]
     last    = float(df["Close"].iloc[-1])
     pred_p  = last * np.exp(pred_lr)
@@ -412,15 +321,15 @@ def forecast_future(model, f_scaler, t_scaler, df, cfg, n_days=30):
     last_p  = float(df["Close"].iloc[-1])
 
     X_raw   = f_scaler.transform(df[FEATURE_COLS])
-    seq     = X_raw[-seq_len:][np.newaxis].astype(np.float32)
+    seq     = X_raw[-seq_len:][np.newaxis].copy()
 
     log_rets = []
     for _ in range(n_days):
-        pred_s  = model.predict(seq)                    # (1, 1)
+        pred_s  = model.predict(seq, verbose=0)
         pred_lr = t_scaler.inverse_transform(pred_s)[0, 0]
         log_rets.append(pred_lr)
         new_row         = seq[0, -1, :].copy()
-        new_row[lr_idx] = float(pred_s[0, 0])
+        new_row[lr_idx] = pred_s[0, 0]
         seq             = np.roll(seq, -1, axis=1)
         seq[0, -1, :]   = new_row
 
@@ -932,8 +841,8 @@ elif page == "🧠  Attention Insights":
 
     st.markdown(
         "<div class='info-box'>Attention weights reveal which of the last "
-        "60 trading days the model focuses on most. Computed live using "
-        "the NumPy GRU engine. Red bars = top 5 most attended days.</div>",
+        "60 trading days the model focuses on most when making each "
+        "prediction. Red bars = top 5 most attended days.</div>",
         unsafe_allow_html=True
     )
 
@@ -942,13 +851,14 @@ elif page == "🧠  Attention Insights":
         st.stop()
 
     with st.spinner("Computing attention weights…"):
+        # Use last 200 rows of data for the attention analysis
         subset = df.tail(200 + SEQUENCE_LEN)
         X_raw  = f_scaler.transform(subset[FEATURE_COLS])
         y_raw  = t_scaler.transform(subset[["Log_Return"]])
         X, _   = make_sequences(X_raw, y_raw, SEQUENCE_LEN)
-        _      = model.predict(X)                        # populates internal alpha
-        attn_w = model.get_attention_weights()           # (n, T, 1)
+        _, attn_w = attn_model.predict(X, verbose=0, batch_size=64)
 
+    # Average + single-sample tabs
     tab1, tab2 = st.tabs(["📊 Average (Last 200 days)", "🔍 Single day"])
 
     with tab1:
@@ -956,9 +866,9 @@ elif page == "🧠  Attention Insights":
             chart_attention(attn_w, SEQUENCE_LEN),
             use_container_width=True
         )
-        avg      = attn_w.mean(axis=0).flatten()
-        top5     = sorted(np.argsort(avg)[-5:][::-1],
-                          key=lambda i: avg[i], reverse=True)
+        avg  = attn_w.mean(axis=0).flatten()
+        top5 = sorted(np.argsort(avg)[-5:][::-1],
+                      key=lambda i: avg[i], reverse=True)
         days_ago = list(range(SEQUENCE_LEN, 0, -1))
 
         st.markdown("<div class='section-header'>Top 5 Attended Days</div>",
@@ -986,8 +896,9 @@ elif page == "🧠  Attention Insights":
     with tab2:
         n_samples = len(attn_w)
         idx = st.slider("Sample index", 0, n_samples - 1, n_samples - 1)
+        sample_w = attn_w[idx:idx+1]
         st.plotly_chart(
-            chart_attention(attn_w[idx:idx+1], SEQUENCE_LEN),
+            chart_attention(sample_w, SEQUENCE_LEN),
             use_container_width=True
         )
         st.caption(f"Date: {subset.index[SEQUENCE_LEN + idx].date()}")
